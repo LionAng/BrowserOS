@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 browseros-cdp.workspace = true
 browseros-core.workspace = true
+aoi-xsg.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 futures-util.workspace = true

@@ -1,6 +1,8 @@
 //! Ultrafast skills on the MCP surface: `run_skill`, and the one internal `run` dispatch that
-//! carries a flow. That dispatch goes down the same path an agent's own `run` takes, so it gets
+//! carries a flow. That dispatch goes down the same path an agent's own `run` takes
+//! (`dispatch_tool_call`, including the grant guard and the inner script hook), so it gets
 //! the same guards, tab ownership and audit record; the tabs it opens belong to the caller.
+//! `run_skill` does not issue grants. A helper or saved skill cannot widen G.
 
 use super::{ClawMcpService, StartedSession, finish_local_dispatch, hosted, session_handle};
 use crate::{

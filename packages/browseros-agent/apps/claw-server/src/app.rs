@@ -66,6 +66,8 @@ pub struct AppState {
     pub tool_calls_daily: Arc<crate::db::tool_calls_daily::ToolCallsDailyRepository>,
     pub profiles: Arc<ProfileService>,
     pub sessions: Arc<Sessions>,
+    /// User-issued cross-site grants, keyed by canonical task id. Empty allows nothing.
+    pub grants: Arc<aoi_xsg::GrantStore>,
     /// Saved native-profile intent is separate from agent profiles and live browser state.
     pub targets: Arc<TargetBindings>,
     pub session_efficiency: Arc<SessionEfficiencyService>,
@@ -271,6 +273,7 @@ impl AppState {
             tool_calls_daily,
             profiles,
             sessions,
+            grants: Arc::new(aoi_xsg::GrantStore::new()),
             targets,
             session_efficiency,
             browser,

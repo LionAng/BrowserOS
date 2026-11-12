@@ -909,7 +909,12 @@ struct RebindHook {
 }
 
 impl InnerCallHook for RebindHook {
-    fn authorize<'a>(&'a self, _page: Option<u32>) -> BoxFuture<'a, Result<(), String>> {
+    fn authorize<'a>(
+        &'a self,
+        _method: &'a str,
+        _origin: Option<&'a str>,
+        _page: Option<u32>,
+    ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async { Ok(()) })
     }
     fn record<'a>(&'a self, _record: InnerCallRecord<'a>) -> BoxFuture<'a, ()> {
@@ -1608,7 +1613,12 @@ struct ClosePinHook {
 }
 
 impl InnerCallHook for ClosePinHook {
-    fn authorize<'a>(&'a self, _page: Option<u32>) -> BoxFuture<'a, Result<(), String>> {
+    fn authorize<'a>(
+        &'a self,
+        _method: &'a str,
+        _origin: Option<&'a str>,
+        _page: Option<u32>,
+    ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async { Ok(()) })
     }
     fn record<'a>(&'a self, _record: InnerCallRecord<'a>) -> BoxFuture<'a, ()> {
