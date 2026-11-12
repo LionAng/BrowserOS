@@ -21,6 +21,7 @@ neo-capture.workspace = true
 browseros-cdp.workspace = true
 browseros-core.workspace = true
 browseros-mcp.workspace = true
+aoi-xsg.workspace = true
 claw-api.workspace = true
 hosted-api.workspace = true
 

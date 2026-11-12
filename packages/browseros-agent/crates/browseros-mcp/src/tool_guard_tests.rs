@@ -77,7 +77,12 @@ impl Drop for HostGuard {
 struct GuardHook(Arc<GuardState>);
 
 impl InnerCallHook for GuardHook {
-    fn authorize<'a>(&'a self, _page: Option<u32>) -> BoxFuture<'a, Result<(), String>> {
+    fn authorize<'a>(
+        &'a self,
+        _method: &'a str,
+        _origin: Option<&'a str>,
+        _page: Option<u32>,
+    ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async { Ok(()) })
     }
 

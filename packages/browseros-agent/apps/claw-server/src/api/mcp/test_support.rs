@@ -122,6 +122,33 @@ pub async fn tool_call_with_behavior(
     ))
 }
 
+/// User-issued page-content read for `url`'s origin on this call's task.
+/// Tests that open or read a synthetic page say so explicitly; an empty grant
+/// store still denies.
+pub async fn issue_user_read(call: &ToolCall, url: &str) -> anyhow::Result<()> {
+    issue_flow(call, url, true).await
+}
+
+/// User-issued tab-metadata list grant for `url`'s origin.
+pub async fn issue_user_list(call: &ToolCall, url: &str) -> anyhow::Result<()> {
+    issue_flow(call, url, false).await
+}
+
+async fn issue_flow(call: &ToolCall, url: &str, read: bool) -> anyhow::Result<()> {
+    let origin = aoi_xsg::Origin::parse(url)
+        .ok_or_else(|| anyhow::anyhow!("not an http(s) origin: {url}"))?;
+    let task = call.state.targets.canonical_task(&call.session_id).await;
+    let flow = if read {
+        aoi_xsg::page_read(origin)
+    } else {
+        aoi_xsg::tab_list(origin)
+    };
+    call.state
+        .grants
+        .issue_grant(aoi_xsg::Issuer::User, task.as_str(), flow.to_draft())?;
+    Ok(())
+}
+
 /// Synthetic CDP peer for host integration tests. It models native catalog,
 /// tab/window identity and group movement so routing errors have visible effects.
 pub(crate) struct ProfileConnection {

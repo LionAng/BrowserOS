@@ -1,0 +1,16 @@
+[package]
+name = "aoi-xsg"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Agent-Origin Isolation with explicit cross-site grants (AOI-XSG)"
+
+[dependencies]
+serde_json.workspace = true
+thiserror.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true
