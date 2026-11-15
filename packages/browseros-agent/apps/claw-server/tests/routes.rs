@@ -1489,6 +1489,61 @@ async fn mcp_session_naming_appends_five_tips_without_elicitation() -> anyhow::R
 }
 
 #[tokio::test]
+async fn mcp_applies_task_grants_and_revocations() -> anyhow::Result<()> {
+    let mock = MockCdp::start().await?;
+    let app = mock_native_app(&mock).await?;
+    app.state.browser.connect_once_for_testing().await?;
+    wait_for_cdp_connected(&app).await?;
+    let owner = initialize_mcp(&app).await?;
+    let other = initialize_mcp(&app).await?;
+    let origin = aoi_xsg::Origin::parse("https://example.com")
+        .ok_or_else(|| anyhow::anyhow!("fixture origin is invalid"))?;
+    let grant = aoi_xsg::page_read(origin);
+    let initial_tabs = mock.tabs.lock().await.len();
+
+    for (id, session, allowed) in [
+        (10, &owner, false),
+        (11, &other, false),
+        (12, &owner, true),
+        (13, &owner, false),
+    ] {
+        if id == 11 {
+            app.state
+                .grants
+                .issue_grant(aoi_xsg::Issuer::User, &owner, grant.to_draft())?;
+        }
+        if id == 13 {
+            assert!(
+                app.state
+                    .grants
+                    .revoke_grant(aoi_xsg::Issuer::User, &owner, &grant)?
+            );
+        }
+        let (status, _, body) = request_json_with_headers(
+            &app.router,
+            "POST",
+            "/mcp",
+            Some(tabs_new_request(id)),
+            &[("mcp-session-id", session)],
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["isError"], !allowed, "case {id}: {body}");
+        if !allowed {
+            assert!(
+                body.to_string().contains(aoi_xsg::REASON_NO_GRANT),
+                "case {id}: {body}"
+            );
+        }
+        assert_eq!(
+            mock.tabs.lock().await.len(),
+            initial_tabs + usize::from(id >= 12)
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn mcp_tabs_new_roundtrips_through_mock_cdp() -> anyhow::Result<()> {
     let mock = MockCdp::start().await?;
     let app = mock_native_app(&mock).await?;
