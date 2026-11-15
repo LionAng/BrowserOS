@@ -101,6 +101,9 @@ impl AppState {
 
     pub async fn new_with_home(config: Arc<Config>, home_dir: PathBuf) -> AppResult<Self> {
         tokio::fs::create_dir_all(&config.browserclaw_dir).await?;
+        let grants_path = config.browserclaw_dir.join("cross-site-grants.json");
+        let grants =
+            tokio::task::spawn_blocking(move || aoi_xsg::GrantStore::open(grants_path)).await??;
         let store = JsonStore::new(config.browserclaw_dir.clone());
         let targets = TargetBindings::load(store.clone()).await?;
         let database = Database::open(config.browserclaw_dir.join(DATABASE_FILENAME)).await?;
@@ -273,7 +276,7 @@ impl AppState {
             tool_calls_daily,
             profiles,
             sessions,
-            grants: Arc::new(aoi_xsg::GrantStore::new()),
+            grants: Arc::new(grants),
             targets,
             session_efficiency,
             browser,

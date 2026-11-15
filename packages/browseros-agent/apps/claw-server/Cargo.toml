@@ -45,6 +45,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde-saphyr.workspace = true
 sha2.workspace = true
+subtle = "2.6"
 pulldown-cmark.workspace = true
 thiserror.workspace = true
 time.workspace = true

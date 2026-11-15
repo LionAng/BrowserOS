@@ -151,6 +151,63 @@ fn load_g_does_not_leak_across_tasks() {
 }
 
 #[test]
+fn persistent_writes_from_two_handles_do_not_overwrite_each_other()
+-> Result<(), Box<dyn std::error::Error>> {
+    let folder = tempfile::tempdir()?;
+    let path = folder.path().join("grants.json");
+    let primary = GrantStore::open(path.clone())?;
+    let secondary = GrantStore::open(path.clone())?;
+    let flow = page_read(origin("https://news.example/"));
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| primary.issue_grant(Issuer::User, "alpha", flow.to_draft()));
+        let second = scope.spawn(|| secondary.issue_grant(Issuer::User, "beta", flow.to_draft()));
+        first
+            .join()
+            .unwrap_or_else(|_| panic!("first writer panicked"))?;
+        second
+            .join()
+            .unwrap_or_else(|_| panic!("second writer panicked"))?;
+        Ok::<_, crate::GrantError>(())
+    })?;
+    drop(primary);
+    drop(secondary);
+
+    let reopened = GrantStore::open(path.clone())?;
+    assert_eq!(reopened.load_G("alpha"), [flow.clone()]);
+    assert_eq!(reopened.load_G("beta"), [flow.clone()]);
+    assert!(reopened.load_G("unknown-task").is_empty());
+    reopened.issue_grant(Issuer::User, "alpha", flow.to_draft())?;
+    assert_eq!(reopened.load_G("alpha"), [flow.clone()]);
+    assert!(reopened.revoke_grant(Issuer::User, "alpha", &flow)?);
+    drop(reopened);
+    let restarted = GrantStore::open(path)?;
+    assert!(restarted.load_G("alpha").is_empty());
+    assert_eq!(restarted.load_G("beta"), [flow]);
+    Ok(())
+}
+
+#[test]
+fn corrupt_grant_file_fails_closed_and_cannot_be_overwritten()
+-> Result<(), Box<dyn std::error::Error>> {
+    let folder = tempfile::tempdir()?;
+    let path = folder.path().join("grants.json");
+    let store = GrantStore::open(path.clone())?;
+    let flow = page_read(origin("https://news.example"));
+    store.issue_grant(Issuer::User, "task", flow.to_draft())?;
+    std::fs::write(&path, b"invalid grant data")?;
+    assert!(store.load_G("task").is_empty());
+    assert!(
+        store
+            .issue_grant(Issuer::User, "task", flow.to_draft())
+            .is_err()
+    );
+    assert!(store.revoke_grant(Issuer::User, "task", &flow).is_err());
+    assert_eq!(std::fs::read(&path)?, b"invalid grant data");
+    assert!(GrantStore::open(path).is_err());
+    Ok(())
+}
+
+#[test]
 fn list_omits_unauthorized_origins_entirely() {
     let news = origin("https://news.example/a");
     let grants = [page_read(news)];

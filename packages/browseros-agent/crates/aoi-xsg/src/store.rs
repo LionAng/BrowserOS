@@ -1,8 +1,14 @@
 //! Grants are stored by task id. An unknown task is empty and allows nothing.
 
 use crate::model::{AllowFlow, FlowDraft, Issuer, Scope, refuse_widen};
-use std::collections::BTreeMap;
-use std::sync::RwLock;
+use std::{
+    collections::BTreeMap,
+    fs::{self, OpenOptions},
+    io::{self, Write},
+    path::{Path, PathBuf},
+    sync::RwLock,
+};
+use tempfile::NamedTempFile;
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -11,11 +17,29 @@ pub enum GrantError {
     IssuerRefused(&'static str),
     #[error("grant denied: missing {0} is not a wildcard")]
     MissingField(&'static str),
+    #[error("grant storage error: {0}")]
+    Storage(String),
 }
 
-#[derive(Debug, Default)]
+type GrantsByTask = BTreeMap<String, Vec<AllowFlow>>;
+
+#[derive(Debug)]
 pub struct GrantStore {
-    by_task: RwLock<BTreeMap<String, Vec<AllowFlow>>>,
+    backend: Backend,
+}
+
+#[derive(Debug)]
+enum Backend {
+    Memory(RwLock<GrantsByTask>),
+    File { path: PathBuf, lock_path: PathBuf },
+}
+
+impl Default for GrantStore {
+    fn default() -> Self {
+        Self {
+            backend: Backend::Memory(RwLock::default()),
+        }
+    }
 }
 
 impl GrantStore {
@@ -24,11 +48,35 @@ impl GrantStore {
         Self::default()
     }
 
-    /// Grants for this task only. An unknown task yields an empty set.
+    /// Open a store in an existing local state directory. A missing file starts empty.
+    pub fn open(path: PathBuf) -> io::Result<Self> {
+        read_file(&path)?;
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        Ok(Self {
+            backend: Backend::File {
+                path,
+                lock_path: lock_path.into(),
+            },
+        })
+    }
+
+    /// Grants for this task only. An unknown task or a failed disk read yields an empty set.
     #[allow(non_snake_case)]
     #[must_use]
     pub fn load_G(&self, task_id: &str) -> Vec<AllowFlow> {
-        self.read().get(task_id).cloned().unwrap_or_default()
+        match &self.backend {
+            Backend::Memory(tasks) => tasks
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(task_id)
+                .cloned()
+                .unwrap_or_default(),
+            Backend::File { path, .. } => read_file(path)
+                .ok()
+                .and_then(|mut tasks| tasks.remove(task_id))
+                .unwrap_or_default(),
+        }
     }
 
     /// Insert one complete grant. Scope defaults to `this_task` when the draft
@@ -43,10 +91,14 @@ impl GrantStore {
             return Err(GrantError::IssuerRefused(issuer_name(issuer)));
         }
         let flow = complete(draft)?;
-        self.write()
-            .entry(task_id.to_owned())
-            .or_default()
-            .push(flow.clone());
+        self.update(|tasks| {
+            let grants = tasks.entry(task_id.to_owned()).or_default();
+            if grants.contains(&flow) {
+                return ((), false);
+            }
+            grants.push(flow.clone());
+            ((), true)
+        })?;
         Ok(flow)
     }
 
@@ -60,22 +112,71 @@ impl GrantStore {
         if refuse_widen(issuer) {
             return Err(GrantError::IssuerRefused(issuer_name(issuer)));
         }
-        let mut tasks = self.write();
-        let Some(grants) = tasks.get_mut(task_id) else {
-            return Ok(false);
-        };
-        let before = grants.len();
-        grants.retain(|grant| grant != flow);
-        Ok(grants.len() != before)
+        self.update(|tasks| {
+            let Some(grants) = tasks.get_mut(task_id) else {
+                return (false, false);
+            };
+            let before = grants.len();
+            grants.retain(|grant| grant != flow);
+            let revoked = grants.len() != before;
+            if grants.is_empty() {
+                tasks.remove(task_id);
+            }
+            (revoked, revoked)
+        })
     }
 
-    fn read(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<String, Vec<AllowFlow>>> {
-        self.by_task.read().unwrap_or_else(|err| err.into_inner())
+    fn update<T>(
+        &self,
+        change: impl FnOnce(&mut GrantsByTask) -> (T, bool),
+    ) -> Result<T, GrantError> {
+        match &self.backend {
+            Backend::Memory(tasks) => {
+                let mut tasks = tasks.write().unwrap_or_else(|error| error.into_inner());
+                Ok(change(&mut tasks).0)
+            }
+            Backend::File { path, lock_path } => {
+                // Lock a separate file so the lock survives replacement of the snapshot.
+                let update = || -> io::Result<T> {
+                    let lock = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .open(lock_path)?;
+                    lock.lock()?;
+                    let mut tasks = read_file(path)?;
+                    let (result, changed) = change(&mut tasks);
+                    if changed {
+                        write_file(path, &tasks)?;
+                    }
+                    Ok(result)
+                };
+                update().map_err(|error| GrantError::Storage(error.to_string()))
+            }
+        }
     }
+}
 
-    fn write(&self) -> std::sync::RwLockWriteGuard<'_, BTreeMap<String, Vec<AllowFlow>>> {
-        self.by_task.write().unwrap_or_else(|err| err.into_inner())
+fn read_file(path: &Path) -> io::Result<GrantsByTask> {
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(io::Error::from),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(GrantsByTask::new()),
+        Err(error) => Err(error),
     }
+}
+
+fn write_file(path: &Path, tasks: &GrantsByTask) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = NamedTempFile::new_in(parent)?;
+    serde_json::to_writer(temporary.as_file_mut(), tasks)?;
+    temporary.as_file_mut().flush()?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
 }
 
 fn complete(draft: FlowDraft) -> Result<AllowFlow, GrantError> {

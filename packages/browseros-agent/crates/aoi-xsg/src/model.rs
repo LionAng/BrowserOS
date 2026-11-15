@@ -1,10 +1,12 @@
 //! Five-field cross-site grants. A missing field is not a wildcard.
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// The agent is a principal parallel to a site. It is not a site, and it is not
 /// "the user".
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Principal {
     Agent,
     Origin(Origin),
@@ -18,7 +20,8 @@ pub enum Principal {
 
 /// `scheme + host + port`, with default ports omitted. Paths are not part of
 /// the principal. `www.example` and `example` are different origins.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Hash, Serialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct Origin {
     pub scheme: String,
     pub host: String,
@@ -55,13 +58,28 @@ impl fmt::Display for Origin {
     }
 }
 
+impl TryFrom<String> for Origin {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(&value).ok_or("expected an absolute HTTP(S) origin")
+    }
+}
+
+impl From<Origin> for String {
+    fn from(origin: Origin) -> Self {
+        origin.to_string()
+    }
+}
+
 /// Origin key for an http(s) URL, or `None` when a flow cannot name an origin.
 #[must_use]
 pub fn origin_of(url: &str) -> Option<String> {
     Origin::parse(url).map(|origin| origin.to_string())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DataClass {
     PageContent,
     TabMetadata,
@@ -73,7 +91,8 @@ pub enum DataClass {
     History,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ActionClass {
     Read,
     List,
@@ -88,7 +107,8 @@ pub enum ActionClass {
 
 /// Issued scope defaults to [`Scope::ThisTask`]. Any other scope is a different
 /// grant, not a wider one.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Scope {
     ThisTask,
     Explicit(String),
@@ -96,7 +116,8 @@ pub enum Scope {
 
 /// A complete five-field grant. Equality is the only match. There is no subset
 /// and no wildcard field.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AllowFlow {
     pub src: Principal,
     pub dst: Principal,
@@ -120,7 +141,8 @@ impl AllowFlow {
 
 /// A grant someone tried to write down. Absent fields stay absent; they are
 /// never filled with "any".
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FlowDraft {
     pub src: Option<Principal>,
     pub dst: Option<Principal>,
