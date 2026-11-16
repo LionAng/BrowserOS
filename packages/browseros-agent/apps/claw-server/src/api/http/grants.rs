@@ -14,7 +14,7 @@ use axum::{
     routing::post,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use serde::Serialize;
+use claw_api::models::Revoked;
 use sha2::{Digest, Sha256};
 use std::{net::SocketAddr, sync::Arc};
 use subtle::ConstantTimeEq;
@@ -108,11 +108,6 @@ async fn issue(
             .map_err(|error| super::internal(&request_id, error.into()))?;
     let flow = result.map_err(|error| grant_error(&request_id, error))?;
     Ok((StatusCode::CREATED, Json(flow)))
-}
-
-#[derive(Serialize)]
-struct Revoked {
-    revoked: bool,
 }
 
 async fn revoke(
