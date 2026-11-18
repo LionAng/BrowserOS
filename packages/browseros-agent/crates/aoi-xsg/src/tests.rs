@@ -1,7 +1,7 @@
 use crate::{
     ActionClass, AllowFlow, DataClass, Decision, FlowDraft, GrantStore, Issuer, Origin, Principal,
     Scope, agent_to_origin, authorize, authorize_tool, covers, credential_list, enforce,
-    filter_listed_pages, history_read, load_G, page_read, refuse_widen, tab_list,
+    filter_listed_pages, history_read, list_visible, load_G, page_read, refuse_widen, tab_list,
 };
 use serde_json::json;
 
@@ -233,6 +233,89 @@ fn explicit_list_grant_reveals_an_origin_that_is_not_otherwise_in_g() {
     let grants = [tab_list(shop)];
     let pages = [json!({"url": "https://shop.example/cart", "title": "Cart"})];
     assert_eq!(filter_listed_pages(&grants, &pages).len(), 1);
+}
+
+#[test]
+fn write_only_destination_is_omitted_and_cannot_be_activated() {
+    let mail = origin("https://mail.example/inbox");
+    let news = origin("https://news.example/story");
+    let write = agent_to_origin(mail.clone(), DataClass::Message, ActionClass::ComposeDraft);
+    let grants = [write.clone(), page_read(news.clone())];
+    assert!(covers(&grants, &write));
+    assert!(!list_visible(&grants, &mail));
+    assert!(list_visible(&grants, &news));
+
+    let pages = [
+        json!({"pageId": 1, "url": "https://news.example/story", "title": "News"}),
+        json!({"pageId": 2, "url": "https://mail.example/inbox", "title": "Inbox"}),
+    ];
+    let visible = filter_listed_pages(&grants, &pages);
+    let rendered = serde_json::to_string(&visible).unwrap_or_default();
+    assert_eq!(
+        visible,
+        vec![json!({"pageId": 1, "url": "https://news.example/story", "title": "News"})]
+    );
+    assert!(!rendered.contains("mail"));
+    assert!(!rendered.contains("Inbox"));
+    assert!(!rendered.contains("\"pageId\":2"));
+
+    assert_eq!(
+        activate(&grants, "https://mail.example/inbox"),
+        Decision::Deny {
+            reason: crate::REASON_NO_GRANT.to_owned(),
+        }
+    );
+    assert_eq!(
+        activate(&grants, "https://news.example/story"),
+        Decision::Allow
+    );
+}
+
+#[test]
+fn src_origin_can_be_activated_including_an_explicit_list_grant() {
+    let mail = origin("https://mail.example/inbox");
+    let listed = [tab_list(mail.clone())];
+    assert!(list_visible(&listed, &mail));
+    let pages = [json!({"pageId": 2, "url": "https://mail.example/inbox", "title": "Inbox"})];
+    assert_eq!(filter_listed_pages(&listed, &pages).len(), 1);
+    assert_eq!(
+        activate(&listed, "https://mail.example/inbox"),
+        Decision::Allow
+    );
+    assert_eq!(
+        authorize(
+            &listed,
+            "observe.snapshot",
+            Some("https://mail.example/inbox")
+        ),
+        Decision::Deny {
+            reason: crate::REASON_NO_GRANT.to_owned(),
+        }
+    );
+
+    let read = [page_read(mail.clone())];
+    assert!(list_visible(&read, &mail));
+    assert_eq!(
+        activate(&read, "https://mail.example/compose"),
+        Decision::Allow
+    );
+
+    let message_read = [AllowFlow {
+        src: Principal::Origin(mail.clone()),
+        dst: Principal::Agent,
+        data_class: DataClass::Message,
+        action_class: ActionClass::Read,
+        scope: Scope::ThisTask,
+    }];
+    assert!(list_visible(&message_read, &mail));
+    assert_eq!(
+        activate(&message_read, "https://mail.example/inbox"),
+        Decision::Allow
+    );
+}
+
+fn activate(grants: &[AllowFlow], url: &str) -> Decision {
+    authorize_tool(grants, "tabs", &json!({"action": "active"}), Some(url))
 }
 
 #[test]

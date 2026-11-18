@@ -8,6 +8,10 @@
 //! This crate is the shared decision core. The host mediator calls it from the
 //! outer grant guard and from the inner script hook; neither path may invent
 //! a second policy.
+//!
+//! List visibility and switching a tab to active share [`list_visible`]: the
+//! origin must be `src` of some grant in the task's G. A destination-only
+//! grant does not reveal that origin.
 
 mod decide;
 mod list;
@@ -16,7 +20,7 @@ mod store;
 
 pub use decide::{
     Decision, REASON_CREDENTIALS_HISTORY, REASON_INDISTINGUISHABLE, REASON_NO_GRANT,
-    REASON_UNCONSTRUCTED, authorize, authorize_tool, covers, enforce, origin_in_G,
+    REASON_UNCONSTRUCTED, authorize, authorize_tool, covers, enforce,
 };
 pub use list::{filter_listed_pages, list_visible};
 pub use model::{

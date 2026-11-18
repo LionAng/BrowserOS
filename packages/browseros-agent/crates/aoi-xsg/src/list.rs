@@ -1,15 +1,20 @@
-//! Tab and page lists hide origins the task has not been granted.
+//! Tab and page lists hide origins that are not a grant source in G.
 
-use crate::decide::{covers, origin_in_G};
-use crate::model::{AllowFlow, Origin, tab_list};
+use crate::model::{AllowFlow, Origin, Principal};
 use serde_json::Value;
 
-/// An origin may be listed when it already appears in G as src or dst, or when
-/// G contains `AllowFlow(origin, Agent, tab_metadata, list, this_task)`.
-/// Nothing is listed by default.
+/// An origin may appear in a page or tab list only when it is `src` of some
+/// grant in the current task's G.
+///
+/// `AllowFlow(origin, Agent, tab_metadata, list, this_task)` names that origin
+/// as `src`, so an explicit list grant reveals it without granting page
+/// content. A write-only grant, where the origin appears only as `dst`,
+/// reveals nothing: no url, no title, and no existence bit.
 #[must_use]
 pub fn list_visible(grants: &[AllowFlow], origin: &Origin) -> bool {
-    origin_in_G(grants, origin) || covers(grants, &tab_list(origin.clone()))
+    grants
+        .iter()
+        .any(|grant| matches!(&grant.src, Principal::Origin(source) if source == origin))
 }
 
 /// Drop pages whose origin is not list-visible. The dropped page is omitted

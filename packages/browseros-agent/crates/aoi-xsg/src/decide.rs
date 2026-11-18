@@ -1,9 +1,10 @@
 //! Shared decisions. `covers` is five-field equality. A flow that cannot be
 //! built is denied. An ambiguous write class is denied rather than guessed.
 
+use crate::list::list_visible;
 use crate::model::{
     ActionClass, AllowFlow, DataClass, Origin, Principal, agent_to_origin, credential_list,
-    history_read, page_read, payment_card_list, tab_list,
+    history_read, page_read, payment_card_list,
 };
 use serde_json::Value;
 
@@ -44,19 +45,6 @@ pub fn enforce(grants: &[AllowFlow], flow: Option<&AllowFlow>) -> Decision {
             reason: REASON_UNCONSTRUCTED.to_owned(),
         },
     }
-}
-
-/// True when `origin` is the source or destination of any grant in G.
-#[allow(non_snake_case)]
-#[must_use]
-pub fn origin_in_G(grants: &[AllowFlow], origin: &Origin) -> bool {
-    grants.iter().any(|grant| {
-        principal_is_origin(&grant.src, origin) || principal_is_origin(&grant.dst, origin)
-    })
-}
-
-fn principal_is_origin(principal: &Principal, origin: &Origin) -> bool {
-    matches!(principal, Principal::Origin(granted) if granted == origin)
 }
 
 /// Authorize one primitive by method name and target origin.
@@ -129,16 +117,13 @@ fn authorize_tabs(grants: &[AllowFlow], args: &Value, page_origin: Option<&str>)
                 },
             }
         }
+        // Same predicate as page and tab lists. A write-only destination
+        // cannot become the active tab.
         "active" => match page_origin.and_then(Origin::parse) {
-            Some(origin) => {
-                if origin_in_G(grants, &origin) || covers(grants, &tab_list(origin)) {
-                    Decision::Allow
-                } else {
-                    Decision::Deny {
-                        reason: REASON_NO_GRANT.to_owned(),
-                    }
-                }
-            }
+            Some(origin) if list_visible(grants, &origin) => Decision::Allow,
+            Some(_) => Decision::Deny {
+                reason: REASON_NO_GRANT.to_owned(),
+            },
             None => Decision::Deny {
                 reason: format!("{REASON_UNCONSTRUCTED} for tabs active"),
             },
