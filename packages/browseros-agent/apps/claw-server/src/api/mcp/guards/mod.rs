@@ -6,4 +6,5 @@
 
 pub mod browser_connected;
 pub mod captcha_busy;
+pub mod grant;
 pub mod navigate_scheme;

@@ -22,6 +22,7 @@ mod claude_desktop;
 mod cockpit;
 mod connections;
 mod feedback;
+mod grants;
 mod help_events;
 mod live;
 mod previews;
@@ -40,6 +41,7 @@ pub(super) const RECORDING_INGEST_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 pub fn router(state: AppState) -> Router<AppState> {
     Router::new()
+        .merge(grants::router(&state))
         .route("/system/health", get(system::health))
         .route("/system/ready", get(system::ready))
         .route("/system/diagnostics", get(system::diagnostics))
@@ -169,7 +171,7 @@ async fn mcp_request_hygiene(req: Request, next: Next) -> Response {
         return StatusCode::NO_CONTENT.into_response();
     }
     let headers = req.headers();
-    if headers.contains_key(header::ORIGIN) || headers.contains_key("sec-fetch-site") {
+    if is_browser_request(headers) {
         return AppError::forbidden("unsupported request").into_response();
     }
     let needs_json = match *req.method() {
@@ -189,6 +191,10 @@ async fn mcp_request_hygiene(req: Request, next: Next) -> Response {
         }
     }
     next.run(req).await
+}
+
+fn is_browser_request(headers: &axum::http::HeaderMap) -> bool {
+    headers.contains_key(header::ORIGIN) || headers.contains_key("sec-fetch-site")
 }
 
 async fn options_preflight(req: Request, next: Next) -> Response {

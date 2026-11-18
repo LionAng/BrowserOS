@@ -258,6 +258,8 @@ pub struct NamedToolObserver {
 // the user's tabs and on other agents' tabs; it is simply told whose they are, by
 // `effects::page_ownership_notice`. See that module for why.
 const GUARDS: &[ToolGuard] = &[
+    // Before any CDP or tool body. Not an ownership check: ownership stays a label.
+    guards::grant::guard,
     guards::captcha_busy::guard,
     guards::navigate_scheme::guard,
     guards::browser_connected::guard,
@@ -722,6 +724,7 @@ pub fn linked_cancel_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::mcp::test_support::{issue_user_list, issue_user_read};
 
     /// Opens `url` through `tool` on a fresh synthetic browser under `behavior`, awaits the
     /// grouping work the effect would otherwise detach, and returns the call with the group
@@ -742,6 +745,7 @@ mod tests {
         let mut call = tool_call_with_behavior(tool, raw_args, mode, behavior).await?;
         call.browser_session = Some(browser.clone());
         call.view = Some(BrowserView::capture(browser.clone(), None, None).await);
+        issue_user_read(&call, url).await?;
         let result = dispatch_tool_call(call.clone()).await?;
         assert_ne!(result.is_error, Some(true), "{result:?}");
         let text = result
@@ -859,6 +863,7 @@ mod tests {
                 tool_call_with_behavior("tabs", args, ServerMode::Hosted, explicit).await?;
             call.browser_session = Some(browser.clone());
             call.view = Some(BrowserView::capture(browser.clone(), None, None).await);
+            issue_user_read(&call, url).await?;
             let result = dispatch_tool_call(call.clone()).await?;
             assert_ne!(result.is_error, Some(true), "{result:?}");
             let page = browser
@@ -1573,6 +1578,7 @@ mod tests {
 
         let state = call.state.clone();
         let session_id = call.session_id.clone();
+        issue_user_list(&call, "https://synthetic.test/").await?;
         let listed = dispatch_tool_call(call).await?;
         assert_ne!(listed.is_error, Some(true), "{listed:?}");
         let notes = listed
@@ -1631,6 +1637,7 @@ mod tests {
         .await?;
         call.browser_session = Some(browser.clone());
         call.view = Some(BrowserView::capture(browser.clone(), None, None).await);
+        issue_user_read(&call, "https://synthetic.test/default").await?;
         assert_eq!(call.state.targets.get(&call.session_id).await, None);
         call.state
             .targets
@@ -1718,6 +1725,7 @@ mod tests {
             )
             .await?;
         call.view = Some(BrowserView::capture(browser.clone(), Some(eng), None).await);
+        issue_user_read(&call, "https://synthetic.test/new").await?;
         // The store has already moved to ops by the time execution starts. Both the
         // primitive and its detached creation hook must still use the admitted eng view.
         call.state
@@ -2343,8 +2351,13 @@ mod tests {
         // cannot be reintroduced without someone deleting this line on purpose.
         assert_eq!(
             GUARDS.len(),
-            3,
-            "a guard was added. Ownership must not be one of them: it informs, it never blocks"
+            4,
+            "grant_guard is the cross-site check. Ownership must not be one of them: it informs, it never blocks"
+        );
+        let grant_guard: ToolGuard = guards::grant::guard;
+        assert!(
+            std::ptr::fn_addr_eq(GUARDS[0], grant_guard),
+            "grant_guard must run before tool execution"
         );
         assert_eq!(
             OBSERVERS

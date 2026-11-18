@@ -1436,6 +1436,11 @@ mod tests {
             json!({"action":"new", "url":"https://synthetic.test/response-handoff"}),
         )
         .await?;
+        crate::api::mcp::test_support::issue_user_read(
+            &call,
+            "https://synthetic.test/response-handoff",
+        )
+        .await?;
         call.browser_session = Some(browser.clone());
         call.view = Some(if bound {
             BrowserView::capture(

@@ -66,16 +66,41 @@ impl InnerCallHook for ScriptInnerCallHook {
         })
     }
 
-    fn authorize<'a>(&'a self, page: Option<u32>) -> BoxFuture<'a, Result<(), String>> {
+    fn authorize<'a>(
+        &'a self,
+        method: &'a str,
+        origin: Option<&'a str>,
+        page: Option<u32>,
+    ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
-            let Some(page) = page else {
-                return Ok(());
-            };
-            if let Some(captcha) = &self.call.state.captcha
+            // Captcha is a reservation, not a grant. It still refuses before G is consulted.
+            if let Some(page) = page
+                && let Some(captcha) = &self.call.state.captcha
                 && let Some(message) = captcha.reservations().busy_message(page)
             {
                 return Err(message);
             }
+            let task = self
+                .call
+                .state
+                .targets
+                .canonical_task(&self.call.session_id)
+                .await;
+            // `from_helper` is not an argument: a helper cannot skip this or widen G.
+            match aoi_xsg::authorize(
+                &self.call.state.grants.load_G(task.as_str()),
+                method,
+                origin,
+            ) {
+                aoi_xsg::Decision::Allow | aoi_xsg::Decision::FilterList => {}
+                aoi_xsg::Decision::DeferToInner => {
+                    return Err("grant denied: nested script is not an inner primitive".to_owned());
+                }
+                aoi_xsg::Decision::Deny { reason } => return Err(reason),
+            }
+            let Some(page) = page else {
+                return Ok(());
+            };
             let Some(identity) = self.identity() else {
                 return Ok(());
             };
@@ -253,16 +278,26 @@ impl InnerCallHook for ScriptInnerCallHook {
 
     fn annotate_pages<'a>(&'a self, pages: &'a [Value]) -> BoxFuture<'a, Vec<Value>> {
         Box::pin(async move {
+            let task = self
+                .call
+                .state
+                .targets
+                .canonical_task(&self.call.session_id)
+                .await;
+            let visible =
+                aoi_xsg::filter_listed_pages(&self.call.state.grants.load_G(task.as_str()), pages);
             let Some(identity) = self.identity() else {
-                return pages.to_vec();
+                return visible;
             };
             // Same tri-bucket ownership view the granular `tabs list` returns, so
             // a code-mode script can tell its own tabs from the user's and other
             // agents' tabs. Code-mode `page_json` keys the id as `pageId`.
+            // Ownership tags are labels. They are applied only to origins G already
+            // allows the list to mention.
             tabs_list_view::annotate_pages_with_ownership(
                 &self.call.state,
                 &identity.ownership_key,
-                pages,
+                &visible,
                 "pageId",
             )
             .await
@@ -366,6 +401,36 @@ mod tests {
         ScriptInnerCallHook::new(call.clone())
     }
 
+    async fn issue_read(
+        call: &crate::api::mcp::dispatch::ToolCall,
+        url: &str,
+    ) -> anyhow::Result<()> {
+        let origin = aoi_xsg::Origin::parse(url)
+            .ok_or_else(|| anyhow::anyhow!("not an http(s) origin: {url}"))?;
+        let task = call.state.targets.canonical_task(&call.session_id).await;
+        call.state.grants.issue_grant(
+            aoi_xsg::Issuer::User,
+            task.as_str(),
+            aoi_xsg::page_read(origin).to_draft(),
+        )?;
+        Ok(())
+    }
+
+    async fn issue_list(
+        call: &crate::api::mcp::dispatch::ToolCall,
+        url: &str,
+    ) -> anyhow::Result<()> {
+        let origin = aoi_xsg::Origin::parse(url)
+            .ok_or_else(|| anyhow::anyhow!("not an http(s) origin: {url}"))?;
+        let task = call.state.targets.canonical_task(&call.session_id).await;
+        call.state.grants.issue_grant(
+            aoi_xsg::Issuer::User,
+            task.as_str(),
+            aoi_xsg::tab_list(origin).to_draft(),
+        )?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn tests_that_captcha_busy_refuses_script_primitives_before_ownership()
     -> anyhow::Result<()> {
@@ -382,22 +447,58 @@ mod tests {
             .map_err(|_| anyhow::anyhow!("busy"))?;
         let hook = hook_for(&call);
         let expected = "page 42 is busy: solve_captcha (request cap_test) is working on an unknown CAPTCHA (detecting, 0s). Wait for it to return, then take a fresh snapshot.";
-        assert_eq!(hook.authorize(Some(42)).await, Err(expected.into()));
+        issue_read(&call, "https://synthetic.test/").await?;
+        assert_eq!(
+            hook.authorize(
+                "observe.snapshot",
+                Some("https://synthetic.test/"),
+                Some(42)
+            )
+            .await,
+            Err(expected.into())
+        );
         assert!(
             call.foreign_pages
                 .lock()
                 .map_err(|_| anyhow::anyhow!("poisoned"))?
                 .is_empty()
         );
-        assert!(hook.authorize(Some(7)).await.is_ok());
-        assert!(hook.authorize(None).await.is_ok());
+        assert!(
+            hook.authorize(
+                "observe.snapshot",
+                Some("https://synthetic.test/page"),
+                Some(7)
+            )
+            .await
+            .is_ok()
+        );
+        assert!(
+            hook.authorize("cdp:Runtime.evaluate", None, None)
+                .await
+                .is_err()
+        );
         call.identity = None;
         assert_eq!(
-            hook_for(&call).authorize(Some(42)).await,
+            hook_for(&call)
+                .authorize(
+                    "observe.snapshot",
+                    Some("https://synthetic.test/"),
+                    Some(42)
+                )
+                .await,
             Err(expected.into())
         );
         call.state.captcha = None;
-        assert!(hook_for(&call).authorize(Some(42)).await.is_ok());
+        assert!(
+            hook_for(&call)
+                .authorize(
+                    "observe.snapshot",
+                    Some("https://synthetic.test/"),
+                    Some(42)
+                )
+                .await
+                .is_ok()
+        );
         Ok(())
     }
 
@@ -639,28 +740,17 @@ mod tests {
 
     #[tokio::test]
     /// Ownership never refuses. A script may act on the user's tabs and on other
-    /// agents' tabs; it is told whose they are, it is not stopped.
-    ///
-    /// This test previously asserted the opposite. It was changed deliberately: the
-    /// refusal made the user's own tabs unusable from a script, and orphaned a
-    /// script's own pages whenever a session handle went missing.
+    /// agents' tabs when a User grant covers the flow; it is told whose they are.
+    /// The grant is the permission. The ownership label is not.
     async fn authorize_never_refuses_on_ownership() -> anyhow::Result<()> {
         let call = tool_call("run", json!({ "code": "return 1" })).await?;
         let hook = hook_for(&call);
-
-        // Another conversation's page: allowed.
+        let origin = Some("https://synthetic.test/owned");
         call.state
             .sessions
             .ownership()
             .claim_page(ConvoId::new("other"), PageId(7))
             .await;
-        assert!(hook.authorize(Some(7)).await.is_ok());
-
-        // An unclaimed page is one of the user's own: allowed.
-        assert!(hook.authorize(Some(9)).await.is_ok());
-        assert!(hook.authorize(None).await.is_ok());
-
-        // And the caller's own page, as before.
         let mine = call
             .identity
             .as_ref()
@@ -672,7 +762,42 @@ mod tests {
             .ownership()
             .claim_page(mine, PageId(3))
             .await;
-        assert!(hook.authorize(Some(3)).await.is_ok());
+
+        // No grant: every page is denied, including the caller's own. An absent
+        // origin is denied too. Ownership does not fill that gap.
+        assert!(
+            hook.authorize("observe.snapshot", origin, Some(7))
+                .await
+                .is_err()
+        );
+        assert!(
+            hook.authorize("observe.snapshot", origin, Some(9))
+                .await
+                .is_err()
+        );
+        assert!(
+            hook.authorize("observe.snapshot", origin, Some(3))
+                .await
+                .is_err()
+        );
+        assert!(hook.authorize("cdp:", None, None).await.is_err());
+
+        issue_read(&call, "https://synthetic.test/owned").await?;
+        assert!(
+            hook.authorize("observe.snapshot", origin, Some(7))
+                .await
+                .is_ok()
+        );
+        assert!(
+            hook.authorize("observe.snapshot", origin, Some(9))
+                .await
+                .is_ok()
+        );
+        assert!(
+            hook.authorize("observe.snapshot", origin, Some(3))
+                .await
+                .is_ok()
+        );
         Ok(())
     }
 
@@ -699,11 +824,19 @@ mod tests {
             .claim_page(ConvoId::new("other"), PageId(7))
             .await;
         let hook = hook_for(&call);
+        issue_read(&call, "https://synthetic.test/page").await?;
+        let origin = Some("https://synthetic.test/page");
 
-        hook.authorize(Some(3)).await.ok();
-        hook.authorize(Some(7)).await.ok();
-        hook.authorize(Some(9)).await.ok();
-        hook.authorize(None).await.ok();
+        hook.authorize("observe.snapshot", origin, Some(3))
+            .await
+            .map_err(anyhow::Error::msg)?;
+        hook.authorize("observe.snapshot", origin, Some(7))
+            .await
+            .map_err(anyhow::Error::msg)?;
+        hook.authorize("observe.snapshot", origin, Some(9))
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert!(hook.authorize("pages.newPage", None, None).await.is_err());
 
         let recorded = call
             .foreign_pages
@@ -739,16 +872,27 @@ mod tests {
             .claim_page(ConvoId::new("other"), PageId(7))
             .await;
         let hook = hook_for(&call);
+        let pages = [
+            json!({ "pageId": 1, "url": "https://user.test", "title": "User" }),
+            json!({ "pageId": 3, "url": "https://mine.test", "title": "Mine" }),
+            json!({ "pageId": 7, "url": "https://other.test", "title": "Other" }),
+        ];
+        let hidden = hook.annotate_pages(&pages).await;
+        assert!(
+            hidden.is_empty(),
+            "no grant, so the list admits nothing: {hidden:?}"
+        );
+        for url in [
+            "https://user.test",
+            "https://mine.test",
+            "https://other.test",
+        ] {
+            issue_list(&call, url).await?;
+        }
 
         // Code-mode pages key the id as `pageId` (not `page`); the hook must tag
         // each with its ownership bucket so the script can tell tabs apart.
-        let annotated = hook
-            .annotate_pages(&[
-                json!({ "pageId": 1, "url": "https://user.test" }),
-                json!({ "pageId": 3, "url": "https://mine.test" }),
-                json!({ "pageId": 7, "url": "https://other.test" }),
-            ])
-            .await;
+        let annotated = hook.annotate_pages(&pages).await;
         let bucket = |page: &Value| {
             page.get("ownership")
                 .and_then(Value::as_str)
@@ -776,14 +920,23 @@ mod tests {
             .clone();
         let hook = hook_for(&call);
 
-        // A page the script opens is claimed for the agent, so a subsequent
-        // primitive on it authorizes and the cockpit can attribute it.
+        // A page the script opens is claimed for the agent so the cockpit can
+        // attribute it. The claim is a label, not a grant, so the next read
+        // still needs a User-issued flow.
         hook.on_page_created(5).await;
         assert_eq!(
             call.state.sessions.owner_of_page(&PageId(5)).await,
             Some(mine)
         );
-        assert!(hook.authorize(Some(5)).await.is_ok());
+        assert!(
+            hook.authorize(
+                "observe.snapshot",
+                Some("https://synthetic.test/new"),
+                Some(5)
+            )
+            .await
+            .is_err()
+        );
         Ok(())
     }
 
@@ -900,5 +1053,276 @@ mod tests {
         // A distinct host does not collide.
         assert!(hook.list_helpers("docs.google.com").await.is_empty());
         Ok(())
+    }
+
+    /// E1–E18 at the hook. These are spec decisions, not live-browser attacks.
+    #[tokio::test]
+    async fn aoi_xsg_rows_e1_through_e18() -> anyhow::Result<()> {
+        let call = tool_call("run", json!({ "code": "return 1" })).await?;
+        let hook = hook_for(&call);
+        let task = call.state.targets.canonical_task(&call.session_id).await;
+        let news = "https://news.example/story";
+        let mail = "https://mail.example/inbox";
+        let calendar = "https://calendar.example/week";
+        let shop_a = "https://shop-a.example/item";
+        let shop_b = "https://shop-b.example/item";
+        let bank = "https://bank.example/home";
+        let other = "https://other.example/page";
+
+        let decide = |method: &'static str, url: &'static str| {
+            let hook = hook_for(&call);
+            async move { hook.authorize(method, Some(url), None).await }
+        };
+
+        // E13 unauthorized mail write, empty G.
+        assert!(decide("mail.send", mail).await.is_err());
+        // E17 a grant on another task does not apply.
+        let elsewhere = page_flow(news, true)?;
+        call.state.grants.issue_grant(
+            aoi_xsg::Issuer::User,
+            "some-other-task",
+            elsewhere.to_draft(),
+        )?;
+        assert!(aoi_xsg::load_G(&call.state.grants, "missing-task").is_empty());
+        assert!(decide("observe.snapshot", news).await.is_err());
+        // E18 page-absent and inner script tools that an outer-only guard would miss.
+        assert!(hook.authorize("cdp:", None, None).await.is_err());
+        assert!(hook.authorize("cdpJsonForPage:", None, None).await.is_err());
+        assert!(hook.authorize("pages.newPage", None, None).await.is_err());
+        assert!(
+            hook.authorize("tool:evaluate_in_page", Some(news), Some(1))
+                .await
+                .is_err()
+        );
+        assert!(
+            hook.authorize("pages.list", None, None).await.is_ok(),
+            "list is allowed only so results can be filtered"
+        );
+        // from_helper is not a parameter; the same call denies either way.
+        assert!(decide("mail.send", mail).await.is_err());
+
+        // E4 missing field is not a wildcard.
+        let incomplete = aoi_xsg::FlowDraft {
+            src: Some(aoi_xsg::Principal::Agent),
+            dst: Some(aoi_xsg::Principal::Origin(
+                aoi_xsg::Origin::parse(mail).ok_or_else(|| anyhow::anyhow!("mail"))?,
+            )),
+            data_class: None,
+            action_class: Some(aoi_xsg::ActionClass::Send),
+            scope: None,
+        };
+        assert!(
+            call.state
+                .grants
+                .issue_grant(aoi_xsg::Issuer::User, task.as_str(), incomplete)
+                .is_err()
+        );
+        // E15 non-users cannot issue or revoke.
+        let news_read = page_flow(news, true)?;
+        for issuer in [
+            aoi_xsg::Issuer::Page,
+            aoi_xsg::Issuer::Planner,
+            aoi_xsg::Issuer::Llm,
+            aoi_xsg::Issuer::SaveSkill,
+            aoi_xsg::Issuer::Helper,
+        ] {
+            assert!(aoi_xsg::refuse_widen(issuer));
+            assert!(
+                call.state
+                    .grants
+                    .issue_grant(issuer, task.as_str(), news_read.to_draft())
+                    .is_err()
+            );
+            assert!(
+                call.state
+                    .grants
+                    .revoke_grant(issuer, task.as_str(), &news_read)
+                    .is_err()
+            );
+        }
+
+        call.state.grants.issue_grant(
+            aoi_xsg::Issuer::User,
+            task.as_str(),
+            news_read.to_draft(),
+        )?;
+        let compose = write_flow(
+            mail,
+            aoi_xsg::DataClass::Message,
+            aoi_xsg::ActionClass::ComposeDraft,
+        )?;
+        call.state
+            .grants
+            .issue_grant(aoi_xsg::Issuer::User, task.as_str(), compose.to_draft())?;
+        // E1 summarize-to-mail draft.
+        assert!(decide("observe.snapshot", news).await.is_ok());
+        assert!(decide("mail.compose_draft", mail).await.is_ok());
+        // E2 compose_draft does not cover send.
+        assert!(decide("mail.send", mail).await.is_err());
+        // E3 scope equality. A differently scoped send grant does not cover this task.
+        let mut wrong_scope = write_flow(
+            mail,
+            aoi_xsg::DataClass::Message,
+            aoi_xsg::ActionClass::Send,
+        )?;
+        wrong_scope.scope = aoi_xsg::Scope::Explicit("next-task".to_owned());
+        call.state.grants.issue_grant(
+            aoi_xsg::Issuer::User,
+            task.as_str(),
+            wrong_scope.to_draft(),
+        )?;
+        assert!(decide("mail.send", mail).await.is_err());
+
+        // E14 bank stays denied while news is granted.
+        assert!(decide("observe.snapshot", bank).await.is_err());
+
+        let mail_read = aoi_xsg::AllowFlow {
+            src: aoi_xsg::Principal::Origin(
+                aoi_xsg::Origin::parse(mail).ok_or_else(|| anyhow::anyhow!("mail"))?,
+            ),
+            dst: aoi_xsg::Principal::Agent,
+            data_class: aoi_xsg::DataClass::Message,
+            action_class: aoi_xsg::ActionClass::Read,
+            scope: aoi_xsg::Scope::ThisTask,
+        };
+        let create = write_flow(
+            calendar,
+            aoi_xsg::DataClass::Event,
+            aoi_xsg::ActionClass::CreateEvent,
+        )?;
+        call.state.grants.issue_grant(
+            aoi_xsg::Issuer::User,
+            task.as_str(),
+            mail_read.to_draft(),
+        )?;
+        call.state
+            .grants
+            .issue_grant(aoi_xsg::Issuer::User, task.as_str(), create.to_draft())?;
+        // E5 mail-to-calendar.
+        assert!(decide("mail.read", mail).await.is_ok());
+        assert!(decide("calendar.create_event", calendar).await.is_ok());
+        // E6 create_event does not cover delete.
+        assert!(decide("calendar.delete", calendar).await.is_err());
+
+        for url in [shop_a, shop_b] {
+            call.state.grants.issue_grant(
+                aoi_xsg::Issuer::User,
+                task.as_str(),
+                page_flow(url, true)?.to_draft(),
+            )?;
+        }
+        let cart = write_flow(
+            shop_a,
+            aoi_xsg::DataClass::Cart,
+            aoi_xsg::ActionClass::AddToCart,
+        )?;
+        call.state
+            .grants
+            .issue_grant(aoi_xsg::Issuer::User, task.as_str(), cart.to_draft())?;
+        // E7 compare and add to cart.
+        assert!(decide("observe.snapshot", shop_a).await.is_ok());
+        assert!(decide("observe.snapshot", shop_b).await.is_ok());
+        assert!(decide("shop.add_to_cart", shop_a).await.is_ok());
+        // E8 / E9 pay and set_address are different fields.
+        assert!(decide("shop.pay", shop_a).await.is_err());
+        assert!(decide("shop.set_address", shop_a).await.is_err());
+
+        // Precise grants for both sides of each pair still do not cover a
+        // classifier that cannot tell them apart (E10–E12).
+        for flow in [
+            write_flow(
+                mail,
+                aoi_xsg::DataClass::Message,
+                aoi_xsg::ActionClass::Send,
+            )?,
+            write_flow(
+                calendar,
+                aoi_xsg::DataClass::Event,
+                aoi_xsg::ActionClass::Delete,
+            )?,
+            write_flow(
+                shop_a,
+                aoi_xsg::DataClass::Payment,
+                aoi_xsg::ActionClass::Pay,
+            )?,
+            write_flow(
+                shop_a,
+                aoi_xsg::DataClass::Payment,
+                aoi_xsg::ActionClass::SetAddress,
+            )?,
+        ] {
+            call.state
+                .grants
+                .issue_grant(aoi_xsg::Issuer::User, task.as_str(), flow.to_draft())?;
+        }
+        assert!(decide("mail.compose_or_send", mail).await.is_err());
+        assert!(decide("calendar.create_or_delete", calendar).await.is_err());
+        assert!(decide("shop.cart_or_pay", shop_a).await.is_err());
+        // Inner evaluate still denies after the read grant. An outer-only guard
+        // on `run` would not have seen this primitive.
+        assert!(
+            hook.authorize("tool:evaluate_in_page", Some(news), Some(1))
+                .await
+                .is_err()
+        );
+
+        // E16 list omission. news is in G, so it may show. bank must not.
+        // `other` appears only after an explicit list grant.
+        let hidden = hook
+            .annotate_pages(&[
+                json!({"pageId": 1, "url": news, "title": "News"}),
+                json!({"pageId": 2, "url": bank, "title": "Bank"}),
+                json!({"pageId": 3, "url": other, "title": "Other"}),
+            ])
+            .await;
+        let rendered = serde_json::to_string(&hidden)?;
+        assert!(rendered.contains("news.example"), "{rendered}");
+        assert!(!rendered.contains("bank"), "{rendered}");
+        assert!(!rendered.contains("other.example"), "{rendered}");
+        assert_eq!(hidden.len(), 1);
+        call.state.grants.issue_grant(
+            aoi_xsg::Issuer::User,
+            task.as_str(),
+            aoi_xsg::tab_list(
+                aoi_xsg::Origin::parse(other).ok_or_else(|| anyhow::anyhow!("other"))?,
+            )
+            .to_draft(),
+        )?;
+        let listed = hook
+            .annotate_pages(&[
+                json!({"pageId": 2, "url": bank, "title": "Bank"}),
+                json!({"pageId": 3, "url": other, "title": "Other"}),
+            ])
+            .await;
+        let rendered = serde_json::to_string(&listed)?;
+        assert!(!rendered.contains("bank"), "{rendered}");
+        assert!(rendered.contains("other.example"), "{rendered}");
+        assert!(call.state.grants.revoke_grant(
+            aoi_xsg::Issuer::User,
+            task.as_str(),
+            &news_read
+        )?);
+        assert!(decide("observe.snapshot", news).await.is_err());
+        Ok(())
+    }
+
+    fn page_flow(url: &str, read: bool) -> anyhow::Result<aoi_xsg::AllowFlow> {
+        let origin =
+            aoi_xsg::Origin::parse(url).ok_or_else(|| anyhow::anyhow!("not an origin: {url}"))?;
+        Ok(if read {
+            aoi_xsg::page_read(origin)
+        } else {
+            aoi_xsg::tab_list(origin)
+        })
+    }
+
+    fn write_flow(
+        url: &str,
+        data: aoi_xsg::DataClass,
+        action: aoi_xsg::ActionClass,
+    ) -> anyhow::Result<aoi_xsg::AllowFlow> {
+        let origin =
+            aoi_xsg::Origin::parse(url).ok_or_else(|| anyhow::anyhow!("not an origin: {url}"))?;
+        Ok(aoi_xsg::agent_to_origin(origin, data, action))
     }
 }

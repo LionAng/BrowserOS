@@ -359,10 +359,13 @@ async fn serve_with_boot_task(
     });
     let shutdown = runtime.state().shutdown;
     runtime.spawn_task("harness integration reconciliation", boot_task);
-    axum::serve(listener, app.into_make_service())
-        .with_graceful_shutdown(wait_for_shutdown(shutdown))
-        .await
-        .context("claw-server listener failed")
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(wait_for_shutdown(shutdown))
+    .await
+    .context("claw-server listener failed")
 }
 
 async fn serve_stdio(state: AppState) -> anyhow::Result<()> {

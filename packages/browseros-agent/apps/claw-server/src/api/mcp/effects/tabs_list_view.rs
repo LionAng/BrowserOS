@@ -12,19 +12,33 @@ pub fn apply(context: ToolEffectContext<'_>) -> BoxFuture<'_, anyhow::Result<Opt
         if context.result.is_error || !context.call.flags.list_tabs {
             return Ok(None);
         }
+        let task = context
+            .call
+            .state
+            .targets
+            .canonical_task(&context.call.session_id)
+            .await;
+        let grants = context.call.state.grants.load_G(task.as_str());
+        let pages = context
+            .result
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.get("pages"))
+            .and_then(Value::as_array)
+            .map(|pages| aoi_xsg::filter_listed_pages(&grants, pages))
+            .unwrap_or_default();
         let Some(identity) = &context.call.identity else {
-            return Ok(None);
-        };
-        let Some(Value::Object(structured)) = context.result.structured_content.as_ref() else {
-            return Ok(None);
-        };
-        let Some(pages) = structured.get("pages").and_then(Value::as_array) else {
-            return Ok(None);
+            return Ok(Some(ToolResult {
+                content: vec![ContentBlock::text(render_tabs(&pages))],
+                structured_content: Some(json!({ "pages": pages })),
+                is_error: false,
+                audit_hints: None,
+            }));
         };
         let annotated = annotate_pages_with_ownership(
             &context.call.state,
             &identity.ownership_key,
-            pages,
+            &pages,
             "page",
         )
         .await;
@@ -195,6 +209,21 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    async fn issue_list(
+        call: &crate::api::mcp::dispatch::ToolCall,
+        url: &str,
+    ) -> anyhow::Result<()> {
+        let origin = aoi_xsg::Origin::parse(url)
+            .ok_or_else(|| anyhow::anyhow!("not an http(s) origin: {url}"))?;
+        let task = call.state.targets.canonical_task(&call.session_id).await;
+        call.state.grants.issue_grant(
+            aoi_xsg::Issuer::User,
+            task.as_str(),
+            aoi_xsg::tab_list(origin).to_draft(),
+        )?;
+        Ok(())
+    }
+
     /// The group id has to reach the rendered text, because the text is what the
     /// model reads. Without it an agent cannot name the group it is working in,
     /// so it cannot ask to rejoin that group after a reconnect. The list result
@@ -204,6 +233,8 @@ mod tests {
     {
         let call =
             crate::api::mcp::test_support::tool_call("tabs", json!({ "action": "list" })).await?;
+        issue_list(&call, "https://mine.test").await?;
+        issue_list(&call, "https://user.test").await?;
         let identity = call.identity.as_ref().unwrap_or_else(|| unreachable!());
         call.state
             .sessions
@@ -247,6 +278,13 @@ mod tests {
     -> anyhow::Result<()> {
         let call =
             crate::api::mcp::test_support::tool_call("tabs", json!({ "action": "list" })).await?;
+        for url in [
+            "https://owned.test",
+            "https://user.test",
+            "https://other.test",
+        ] {
+            issue_list(&call, url).await?;
+        }
         let transport = crate::api::mcp::test_support::ProfileConnection::new();
         // Include a fourth global page; the result below projects a different order.
         let fourth = transport.tabs.lock().unwrap_or_else(|p| p.into_inner())[0].clone();

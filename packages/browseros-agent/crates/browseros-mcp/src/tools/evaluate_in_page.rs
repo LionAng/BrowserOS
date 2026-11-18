@@ -99,6 +99,22 @@ async fn evaluate_in_page(raw: Value, ctx: &ToolCtx) -> ToolExecResult<Option<To
     if let Some(result) = pending_dialog_result(ctx, PageId(args.page)) {
         return Ok(Some(result));
     }
+    // High-privilege on the target origin. A read grant does not cover it, and
+    // the call must not widen G. Absent hook is the non-production mcp server;
+    // claw-server's /mcp path installs the hook and also denies this tool in
+    // the outer grant guard.
+    if let Some(hook) = &ctx.inner_call_hook {
+        let origin = match ctx.browser.page(PageId(args.page)).await {
+            Ok(info) => aoi_xsg::origin_of(&info.url),
+            Err(_) => None,
+        };
+        if let Err(reason) = hook
+            .authorize("evaluate_in_page", origin.as_deref(), Some(args.page))
+            .await
+        {
+            return Ok(Some(error_result(reason)));
+        }
+    }
     let page = ctx.browser.page_session(PageId(args.page)).await?;
     let timeout = clamp_timeout(args.timeout, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
     // Read the page's mutation counter either side of the evaluation, so a

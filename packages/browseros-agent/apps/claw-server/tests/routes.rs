@@ -1429,6 +1429,7 @@ async fn mcp_session_naming_appends_five_tips_without_elicitation() -> anyhow::R
     send_initialized(&app.router, &session_id).await?;
 
     wait_for_session_registration(&app, &session_id).await?;
+    allow_page_read(&app, &session_id, "https://example.com").await?;
     let session = app
         .state
         .sessions
@@ -1488,12 +1489,68 @@ async fn mcp_session_naming_appends_five_tips_without_elicitation() -> anyhow::R
 }
 
 #[tokio::test]
+async fn mcp_applies_task_grants_and_revocations() -> anyhow::Result<()> {
+    let mock = MockCdp::start().await?;
+    let app = mock_native_app(&mock).await?;
+    app.state.browser.connect_once_for_testing().await?;
+    wait_for_cdp_connected(&app).await?;
+    let owner = initialize_mcp(&app).await?;
+    let other = initialize_mcp(&app).await?;
+    let origin = aoi_xsg::Origin::parse("https://example.com")
+        .ok_or_else(|| anyhow::anyhow!("fixture origin is invalid"))?;
+    let grant = aoi_xsg::page_read(origin);
+    let initial_tabs = mock.tabs.lock().await.len();
+
+    for (id, session, allowed) in [
+        (10, &owner, false),
+        (11, &other, false),
+        (12, &owner, true),
+        (13, &owner, false),
+    ] {
+        if id == 11 {
+            app.state
+                .grants
+                .issue_grant(aoi_xsg::Issuer::User, &owner, grant.to_draft())?;
+        }
+        if id == 13 {
+            assert!(
+                app.state
+                    .grants
+                    .revoke_grant(aoi_xsg::Issuer::User, &owner, &grant)?
+            );
+        }
+        let (status, _, body) = request_json_with_headers(
+            &app.router,
+            "POST",
+            "/mcp",
+            Some(tabs_new_request(id)),
+            &[("mcp-session-id", session)],
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["isError"], !allowed, "case {id}: {body}");
+        if !allowed {
+            assert!(
+                body.to_string().contains(aoi_xsg::REASON_NO_GRANT),
+                "case {id}: {body}"
+            );
+        }
+        assert_eq!(
+            mock.tabs.lock().await.len(),
+            initial_tabs + usize::from(id >= 12)
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn mcp_tabs_new_roundtrips_through_mock_cdp() -> anyhow::Result<()> {
     let mock = MockCdp::start().await?;
     let app = mock_native_app(&mock).await?;
     app.state.browser.connect_once_for_testing().await?;
     wait_for_cdp_connected(&app).await?;
     let session_id = initialize_mcp(&app).await?;
+    allow_page_read(&app, &session_id, "https://example.com").await?;
 
     let (status, _headers, body) = request_json_with_headers(
         &app.router,
@@ -1605,6 +1662,8 @@ async fn same_name_mcp_sessions_have_distinct_groups_and_label_cross_page_access
         .await
         .ok_or_else(|| anyhow::anyhow!("second session missing"))?;
     assert_ne!(session_a.convo_id(), session_b.convo_id());
+    allow_page_read(&app, &session_a_id, "https://example.com").await?;
+    allow_page_read(&app, &session_b_id, "https://example.com").await?;
 
     for (id, session_id) in [(10, &session_a_id), (11, &session_b_id)] {
         let (status, _headers, body) = request_json_with_headers(
@@ -1710,6 +1769,7 @@ async fn canonical_cancel_endpoint_aborts_in_flight_dispatch() -> anyhow::Result
     app.state.browser.connect_once_for_testing().await?;
     wait_for_cdp_connected(&app).await?;
     let session_id = initialize_mcp(&app).await?;
+    allow_page_read(&app, &session_id, "https://example.com").await?;
     let (status, _headers, body) = request_json_with_headers(
         &app.router,
         "POST",
@@ -2457,6 +2517,18 @@ async fn initialize_mcp(app: &TestApp) -> anyhow::Result<String> {
     send_initialized(&app.router, &session_id).await?;
     wait_for_session_registration(app, &session_id).await?;
     Ok(session_id)
+}
+
+async fn allow_page_read(app: &TestApp, session_id: &str, url: &str) -> anyhow::Result<()> {
+    let origin = aoi_xsg::Origin::parse(url)
+        .ok_or_else(|| anyhow::anyhow!("not an http(s) origin: {url}"))?;
+    // A session with no successor alias is its own task id.
+    app.state.grants.issue_grant(
+        aoi_xsg::Issuer::User,
+        session_id,
+        aoi_xsg::page_read(origin).to_draft(),
+    )?;
+    Ok(())
 }
 
 fn tabs_new_request(id: u64) -> Value {

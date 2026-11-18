@@ -382,6 +382,13 @@ impl ClawMcpService {
         raw_args: &Value,
         client_cancel: CancellationToken,
     ) -> CallToolResult {
+        // save_skill is not a User. It cannot carry a grant or widen G.
+        if raw_args.get("grant").is_some() || raw_args.get("allowFlow").is_some() {
+            debug_assert!(aoi_xsg::refuse_widen(aoi_xsg::Issuer::SaveSkill));
+            return CallToolResult::error(vec![rmcp::model::ContentBlock::text(
+                "grant denied: save_skill cannot issue or widen G",
+            )]);
+        }
         let dispatch_id = DispatchId::new();
         let dispatch_cancel = CancellationToken::new();
         if !started
@@ -1357,6 +1364,9 @@ impl ServerHandler for ClawMcpService {
                 self.state.clone(),
                 self.output_files.clone(),
             );
+            // Production /mcp catalog tools. Not BrowserMcpService::tool_ctx
+            // (that path leaves inner_call_hook unset). run_skill's browser half
+            // re-enters through internal_run, which also calls dispatch_tool_call.
             dispatch_tool_call(call).await
         };
 
@@ -2013,14 +2023,15 @@ mod tests {
             ),
             "{run_description}"
         );
-        // Dispatched to the tool, which admits the page before anything else.
+        // No live page, so the grant guard cannot name an origin and denies
+        // before the tool admits the page.
         let refused = call_tool_value(hosted, "setViewport", json!({"page": 1, "mode": "mobile"}))
             .await?
             .map_err(|error| anyhow::anyhow!("{error:?}"))?;
         assert_eq!(refused["isError"], true);
         let text = refused["content"][0]["text"].as_str().unwrap_or_default();
         assert!(
-            text.starts_with("setViewport failed: page_out_of_scope"),
+            text.contains("flow cannot be constructed for setViewport"),
             "{text}"
         );
 

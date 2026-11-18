@@ -986,6 +986,42 @@ fn install_globals<'js>(
 }
 
 impl BrowserBridge {
+    async fn target_origin(
+        &self,
+        method: &str,
+        args: &[Value],
+        page: Option<u32>,
+    ) -> Option<String> {
+        if method == "pages.newPage" {
+            return args
+                .first()
+                .and_then(Value::as_str)
+                .and_then(aoi_xsg::origin_of);
+        }
+        if method == "nav.goto" {
+            return args
+                .get(1)
+                .and_then(Value::as_str)
+                .and_then(aoi_xsg::origin_of);
+        }
+        if method == "cdp" {
+            let session = args.get(2).and_then(Value::as_str)?;
+            let page = self
+                .ctx
+                .browser
+                .page_for_session(&SessionId::from(session.to_owned()))
+                .await?;
+            return self.origin_of_page(page.0).await;
+        }
+        let page = page?;
+        self.origin_of_page(page).await
+    }
+
+    async fn origin_of_page(&self, page: u32) -> Option<String> {
+        let info = self.ctx.browser.page(PageId(page)).await.ok()?;
+        aoi_xsg::origin_of(&info.url)
+    }
+
     /// The page a primitive fills a card into, including raw
     /// `browser.cdp(method, params, sessionId)` sent to a page's session.
     async fn card_fill_page(&self, method: &str, args: &[Value]) -> Option<u32> {
@@ -1021,7 +1057,12 @@ impl BrowserBridge {
         // consumes the owned args below.
         let recorded_args = Value::Array(args.clone());
         if let Some(hook) = &self.ctx.inner_call_hook {
-            hook.authorize(page).await?;
+            // `from_helper` does not skip this and does not widen G. The same
+            // decision runs for a direct primitive and one a helper triggered.
+            let auth_method = classification_method(method, &args);
+            let origin = self.target_origin(method, &args, page).await;
+            hook.authorize(&auth_method, origin.as_deref(), page)
+                .await?;
             if let Some(card_page) = self.card_fill_page(method, &args).await {
                 hook.hold_card_data(card_page).await;
             }
@@ -1646,6 +1687,28 @@ fn tool_result_text(result: &ToolResult) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Method name the grant hook classifies. CDP and credential calls keep the
+/// inner operation in the name so an absent or ambiguous class cannot pass
+/// as the outer bridge method alone.
+fn classification_method(method: &str, args: &[Value]) -> String {
+    match method {
+        "cdp" => format!("cdp:{}", args.first().and_then(Value::as_str).unwrap_or("")),
+        "cdpJsonForPage" => format!(
+            "cdpJsonForPage:{}",
+            args.get(1).and_then(Value::as_str).unwrap_or("")
+        ),
+        "tool:credentials" | "tool:payment_cards" => {
+            let action = args
+                .first()
+                .and_then(|value| value.get("action"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            format!("{method}:{action}")
+        }
+        other => other.to_string(),
+    }
 }
 
 fn parse_bridge_args(args_json: &str) -> Result<Vec<Value>, String> {
@@ -2486,7 +2549,12 @@ mod tests {
     struct MockHook(Arc<Mutex<HookLog>>);
 
     impl InnerCallHook for MockHook {
-        fn authorize<'a>(&'a self, page: Option<u32>) -> BoxFuture<'a, Result<(), String>> {
+        fn authorize<'a>(
+            &'a self,
+            _method: &'a str,
+            _origin: Option<&'a str>,
+            page: Option<u32>,
+        ) -> BoxFuture<'a, Result<(), String>> {
             let mut log = self
                 .0
                 .lock()
@@ -2597,6 +2665,8 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // The direct call is not from a helper; the one inside act() is.
+        // Both were authorized. `from_helper` does not skip the hook.
+        assert_eq!(log.authorized, vec![Some(1), Some(1)]);
         assert_eq!(
             log.from_helper,
             vec![

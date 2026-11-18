@@ -219,11 +219,22 @@ pub trait InnerCallHook: Send + Sync {
         Box::pin(async {})
     }
 
-    /// Authorize a primitive about to run against the caller's ownership.
-    /// `page` is the primitive's target page id, when it addresses one.
+    /// Authorize a primitive before it runs.
+    ///
+    /// `method` is the bridge name (`pages.list`, `cdp:Runtime.evaluate`,
+    /// `tool:evaluate_in_page`). `origin` is the target origin when one can be
+    /// named. An absent origin is not an allow: the host must deny unless the
+    /// method is explicitly a filtered list or a host-local call that discloses
+    /// no site. `page` is only the id used for host notices. It is not a
+    /// permission, and `from_helper` must not skip this call.
     /// `Err(reason)` rejects the primitive and the reason is surfaced to the
     /// script as a thrown error.
-    fn authorize<'a>(&'a self, page: Option<u32>) -> BoxFuture<'a, Result<(), String>>;
+    fn authorize<'a>(
+        &'a self,
+        method: &'a str,
+        origin: Option<&'a str>,
+        page: Option<u32>,
+    ) -> BoxFuture<'a, Result<(), String>>;
 
     /// Record a completed inner primitive as a child audit row.
     fn record<'a>(&'a self, record: InnerCallRecord<'a>) -> BoxFuture<'a, ()>;

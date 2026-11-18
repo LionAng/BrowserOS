@@ -53,7 +53,12 @@ async fn run_marks_password_inputs_before_authorization_can_reject_them() -> any
         fn mark_sensitive_input(&self) {
             self.0.store(true, Ordering::Relaxed);
         }
-        fn authorize<'a>(&'a self, _page: Option<u32>) -> BoxFuture<'a, Result<(), String>> {
+        fn authorize<'a>(
+            &'a self,
+            _method: &'a str,
+            _origin: Option<&'a str>,
+            _page: Option<u32>,
+        ) -> BoxFuture<'a, Result<(), String>> {
             Box::pin(async { Err("fixture authorization refused".into()) })
         }
         fn record<'a>(&'a self, _record: InnerCallRecord<'a>) -> BoxFuture<'a, ()> {
